@@ -63,6 +63,19 @@ struct ntsync_object
     char *name;            /* for named objects */
 };
 
+static void ntsync_wcstombs(char *dst, const WCHAR *src, size_t max)
+{
+    size_t i;
+    for (i = 0; i < max - 1 && src[i]; i++)
+        dst[i] = (char)(src[i] < 0x80 ? src[i] : '?'); // fallback on ASCII
+    dst[i] = '\0';
+}
+
+static inline HANDLE index_to_handle(int index)
+{
+    return (HANDLE)(uintptr_t)((index + 1) << 2);
+}
+
 
 int do_ntsync(void)
 {
@@ -97,8 +110,7 @@ NTSTATUS ntsync_create_event(HANDLE *handle, ACCESS_MASK access,
     const OBJECT_ATTRIBUTES *attr, EVENT_TYPE type, BOOLEAN initial)
 {
     struct ntsync_object *obj = NULL;
-    struct object_attributes *objattr = NULL;
-    data_size_t len;
+    char name[256] = {0};
     int i;
 
     TRACE("creating %s-reset event, initial=%d\n",
@@ -107,13 +119,12 @@ NTSTATUS ntsync_create_event(HANDLE *handle, ACCESS_MASK access,
     obj = calloc(1, sizeof(*obj));
     if (!obj) return STATUS_NO_MEMORY;
 
-    if (alloc_object_attributes(attr, &objattr, &len)) {
-        free(obj);
-        return STATUS_INVALID_PARAMETER;
+    if (attr && attr->ObjectName && attr->ObjectName->Buffer)
+    {
+        WCHAR *wname = attr->ObjectName->Buffer;
+        ntsync_wcstombs(name, wname, sizeof(name));
+        obj->name = strdup(name);
     }
-
-    if (objattr->name)
-        obj->name = strdup(objattr->name);
 
     obj->type = NTSYNC_TYPE_EVENT;
     obj->signaled = initial;
@@ -131,7 +142,6 @@ NTSTATUS ntsync_create_event(HANDLE *handle, ACCESS_MASK access,
             object_table[i] = obj;
             *handle = make_handle(i);
             pthread_mutex_unlock(&table_lock);
-            free(objattr);  // don't forget to release
             TRACE("created handle %p\n", *handle);
             return STATUS_SUCCESS;
         }
@@ -143,15 +153,15 @@ NTSTATUS ntsync_create_event(HANDLE *handle, ACCESS_MASK access,
     pthread_cond_destroy(&obj->cond);
     free(obj->name);
     free(obj);
-    free(objattr);
     return STATUS_TOO_MANY_OPENED_FILES;
 }
 
 NTSTATUS ntsync_set_event(HANDLE handle)
 {
-    int index = handle_to_index(handle);
+    int index;
     struct ntsync_object *obj;
 
+    index = handle_to_index(handle);
     if (index < 0 || index >= MAX_NTSYNC_OBJECTS)
         return STATUS_INVALID_HANDLE;
 
@@ -179,9 +189,10 @@ NTSTATUS ntsync_set_event(HANDLE handle)
 
 NTSTATUS ntsync_reset_event(HANDLE handle)
 {
-    int index = handle_to_index(handle);
+    int index;
     struct ntsync_object *obj;
 
+    index = handle_to_index(handle);
     if (index < 0 || index >= MAX_NTSYNC_OBJECTS)
         return STATUS_INVALID_HANDLE;
 
@@ -203,9 +214,10 @@ NTSTATUS ntsync_reset_event(HANDLE handle)
 }
 
 NTSTATUS ntsync_close(HANDLE handle) {
-    int index = handle_to_index(handle);
+    int index;
     struct ntsync_object *obj;
 
+    index = handle_to_index(handle);
     if (index < 0 || index >= MAX_NTSYNC_OBJECTS) return STATUS_INVALID_HANDLE;
 
     pthread_mutex_lock(&table_lock);
@@ -238,6 +250,7 @@ NTSTATUS ntsync_wait_objects(DWORD count, const HANDLE *handles, BOOLEAN wait_an
                              BOOLEAN alertable, const LARGE_INTEGER *timeout)
 {
     struct ntsync_object *objs[MAX_NTSYNC_OBJECTS];
+    struct ntsync_object *wait_obj = NULL;
     struct timespec ts;
     struct timeval tv;
     LONGLONG now_us, abs_us;
@@ -250,7 +263,6 @@ NTSTATUS ntsync_wait_objects(DWORD count, const HANDLE *handles, BOOLEAN wait_an
     if (!count || count > MAX_NTSYNC_OBJECTS)
         return STATUS_INVALID_PARAMETER;
 
-    /* Lock global table and resolve all handles */
     pthread_mutex_lock(&table_lock);
     for (i = 0; i < count; i++) {
         int index = handle_to_index(handles[i]);
@@ -274,8 +286,7 @@ NTSTATUS ntsync_wait_objects(DWORD count, const HANDLE *handles, BOOLEAN wait_an
                 }
             }
 
-            // Wait only for the first object (simplified implementation)
-            struct ntsync_object *wait_obj = objs[0];
+            wait_obj = objs[0];
 
             if (timeout) {
                 gettimeofday(&tv, NULL);
@@ -293,17 +304,14 @@ NTSTATUS ntsync_wait_objects(DWORD count, const HANDLE *handles, BOOLEAN wait_an
                 pthread_cond_wait(&wait_obj->cond, &wait_obj->lock);
             }
         }
-    }
-    else
-    {
+    } else {
         while (1) {
-            bool all_ready = true;
+            int all_ready = 1;
             for (i = 0; i < count; i++) {
                 struct ntsync_object *obj = objs[i];
 
                 if (obj->type == NTSYNC_TYPE_MUTEX && obj->owner_tid != 0 && obj->owner_tid != tid) {
-                    // TODO: real thread ownership detection on macOS
-                    obj->abandoned = true;
+                    obj->abandoned = 1;
                     obj->owner_tid = 0;
                     obj->count = 0;
                 }
@@ -311,13 +319,15 @@ NTSTATUS ntsync_wait_objects(DWORD count, const HANDLE *handles, BOOLEAN wait_an
                 if ((obj->type == NTSYNC_TYPE_EVENT && !obj->signaled) ||
                     (obj->type == NTSYNC_TYPE_SEMAPHORE && obj->count == 0) ||
                     (obj->type == NTSYNC_TYPE_MUTEX && obj->owner_tid != 0 && obj->owner_tid != tid)) {
-                    all_ready = false;
+                    all_ready = 0;
                     break;
                 }
             }
-            if (all_ready) goto satisfied;
 
-            struct ntsync_object *wait_obj = objs[0];
+            if (all_ready)
+                goto satisfied;
+
+            wait_obj = objs[0];
 
             if (timeout) {
                 gettimeofday(&tv, NULL);
@@ -336,36 +346,36 @@ NTSTATUS ntsync_wait_objects(DWORD count, const HANDLE *handles, BOOLEAN wait_an
             }
         }
     }
-    satisfied:
-        for (i = 0; i < count; i++) {
-            struct ntsync_object *obj = objs[i];
-            switch (obj->type) {
-            case NTSYNC_TYPE_EVENT:
-                if (!obj->manual_reset)
-                    obj->signaled = 0;
-                break;
-            case NTSYNC_TYPE_SEMAPHORE:
-                obj->count--;
-                break;
-            case NTSYNC_TYPE_MUTEX:
-                if (obj->owner_tid == tid)
-                    obj->count++;
-                else {
-                    obj->owner_tid = tid;
-                    obj->count = 1;
-                    obj->abandoned = false;
-                }
-                break;
+
+satisfied:
+    for (i = 0; i < count; i++) {
+        struct ntsync_object *obj = objs[i];
+        switch (obj->type) {
+        case NTSYNC_TYPE_EVENT:
+            if (!obj->manual_reset)
+                obj->signaled = 0;
+            break;
+        case NTSYNC_TYPE_SEMAPHORE:
+            obj->count--;
+            break;
+        case NTSYNC_TYPE_MUTEX:
+            if (obj->owner_tid == tid)
+                obj->count++;
+            else {
+                obj->owner_tid = tid;
+                obj->count = 1;
+                obj->abandoned = 0;
             }
+            break;
         }
-        status = STATUS_SUCCESS;
+    }
 
-        for (i = 0; i < count; i++)
-            pthread_mutex_unlock(&objs[i]->lock);
+done:
+    for (i = 0; i < count; i++)
+        pthread_mutex_unlock(&objs[i]->lock);
 
-        return status;
+    return status;
 }
-
 
 NTSTATUS ntsync_create_mutex(HANDLE *handle, ACCESS_MASK access,
     const OBJECT_ATTRIBUTES *attr, BOOLEAN initial)
@@ -405,9 +415,12 @@ NTSTATUS ntsync_create_mutex(HANDLE *handle, ACCESS_MASK access,
 
 NTSTATUS ntsync_release_mutex(HANDLE handle, LONG *prev)
 {
-    int index = handle_to_index(handle);
+    int index;
     struct ntsync_object *obj;
+
     TRACE("✅ [ntsync] Release Mutex\n");
+
+    index = handle_to_index(handle);
     if (index < 0 || index >= MAX_NTSYNC_OBJECTS)
         return STATUS_INVALID_HANDLE;
 
@@ -482,9 +495,12 @@ NTSTATUS ntsync_create_semaphore(HANDLE *handle, ACCESS_MASK access,
 
 NTSTATUS ntsync_release_semaphore(HANDLE handle, ULONG count, ULONG *prev)
 {
-    int index = handle_to_index(handle);
+    int index;
     struct ntsync_object *obj;
+
     TRACE("✅ [ntsync] Realease Semaphore\n");
+
+    index = handle_to_index(handle);
     if (index < 0 || index >= MAX_NTSYNC_OBJECTS)
         return STATUS_INVALID_HANDLE;
 
@@ -516,10 +532,12 @@ NTSTATUS ntsync_release_semaphore(HANDLE handle, ULONG count, ULONG *prev)
 
 NTSTATUS ntsync_query_event(HANDLE handle, void *info, ULONG *ret_len)
 {
-    int index = handle_to_index(handle);
+    int index;
     struct ntsync_object *obj;
+
     EVENT_BASIC_INFORMATION *out = info;
 
+    index = handle_to_index(handle);
     if (index < 0 || index >= MAX_NTSYNC_OBJECTS) return STATUS_INVALID_HANDLE;
 
     pthread_mutex_lock(&table_lock);
@@ -575,10 +593,13 @@ NTSTATUS ntsync_query_mutex(HANDLE handle, void *info, ULONG *ret_len)
 
 NTSTATUS ntsync_query_semaphore(HANDLE handle, void *info, ULONG *ret_len)
 {
-    int index = handle_to_index(handle);
+    int index;
+
     struct ntsync_object *obj;
     SEMAPHORE_BASIC_INFORMATION *out = info;
     TRACE("✅ [ntsync] Query Semaphore\n");
+
+    index = handle_to_index(handle);
     if (index < 0 || index >= MAX_NTSYNC_OBJECTS) return STATUS_INVALID_HANDLE;
 
     pthread_mutex_lock(&table_lock);
@@ -669,19 +690,17 @@ NTSTATUS ntsync_signal_and_wait(HANDLE signal, HANDLE wait, BOOLEAN alertable,
 
 NTSTATUS ntsync_open_event(HANDLE *handle, ACCESS_MASK access, const OBJECT_ATTRIBUTES *attr)
 {
-    data_size_t len;
-    struct object_attributes *objattr;
     struct ntsync_object *obj = NULL;
+    char name[256] = {0};
 
     TRACE("[ntsync] OpenEvent\n");
 
     *handle = 0;
 
-    if (!handle || !attr)
+    if (!handle || !attr || !attr->ObjectName || !attr->ObjectName->Buffer)
         return STATUS_INVALID_PARAMETER;
 
-    if (alloc_object_attributes(attr, &objattr, &len))
-        return STATUS_INSUFFICIENT_RESOURCES;
+    ntsync_wcstombs(name, attr->ObjectName->Buffer, sizeof(name));
 
     pthread_mutex_lock(&table_lock);
 
@@ -691,7 +710,7 @@ NTSTATUS ntsync_open_event(HANDLE *handle, ACCESS_MASK access, const OBJECT_ATTR
         if (!candidate || candidate->type != NTSYNC_TYPE_EVENT || !candidate->name)
             continue;
 
-        if (objattr->name && strcmp(candidate->name, objattr->name) == 0) {
+        if (strcmp(candidate->name, name) == 0) {
             candidate->refcount++;
             *handle = index_to_handle(i);
             obj = candidate;
@@ -700,29 +719,23 @@ NTSTATUS ntsync_open_event(HANDLE *handle, ACCESS_MASK access, const OBJECT_ATTR
     }
 
     pthread_mutex_unlock(&table_lock);
-    free(objattr);
 
-    if (!obj)
-        return STATUS_OBJECT_NAME_NOT_FOUND;
-
-    return STATUS_SUCCESS;
+    return obj ? STATUS_SUCCESS : STATUS_OBJECT_NAME_NOT_FOUND;
 }
 
 NTSTATUS ntsync_open_mutex(HANDLE *handle, ACCESS_MASK access, const OBJECT_ATTRIBUTES *attr)
 {
-    data_size_t len;
-    struct object_attributes *objattr;
     struct ntsync_object *obj = NULL;
+    char name[256] = {0};
 
     TRACE("[ntsync] OpenMutex\n");
 
     *handle = 0;
 
-    if (!handle || !attr)
+    if (!handle || !attr || !attr->ObjectName || !attr->ObjectName->Buffer)
         return STATUS_INVALID_PARAMETER;
 
-    if (alloc_object_attributes(attr, &objattr, &len))
-        return STATUS_INSUFFICIENT_RESOURCES;
+    ntsync_wcstombs(name, attr->ObjectName->Buffer, sizeof(name));
 
     pthread_mutex_lock(&table_lock);
 
@@ -732,7 +745,7 @@ NTSTATUS ntsync_open_mutex(HANDLE *handle, ACCESS_MASK access, const OBJECT_ATTR
         if (!candidate || candidate->type != NTSYNC_TYPE_MUTEX || !candidate->name)
             continue;
 
-        if (objattr->name && strcmp(candidate->name, objattr->name) == 0) {
+        if (strcmp(candidate->name, name) == 0) {
             candidate->refcount++;
             *handle = index_to_handle(i);
             obj = candidate;
@@ -741,26 +754,23 @@ NTSTATUS ntsync_open_mutex(HANDLE *handle, ACCESS_MASK access, const OBJECT_ATTR
     }
 
     pthread_mutex_unlock(&table_lock);
-    free(objattr);
 
     return obj ? STATUS_SUCCESS : STATUS_OBJECT_NAME_NOT_FOUND;
 }
 
 NTSTATUS ntsync_open_semaphore(HANDLE *handle, ACCESS_MASK access, const OBJECT_ATTRIBUTES *attr)
 {
-    data_size_t len;
-    struct object_attributes *objattr;
     struct ntsync_object *obj = NULL;
+    char name[256] = {0};
 
     TRACE("[ntsync] Open Semaphore\n");
 
     *handle = 0;
 
-    if (!handle || !attr)
+    if (!handle || !attr || !attr->ObjectName || !attr->ObjectName->Buffer)
         return STATUS_INVALID_PARAMETER;
 
-    if (alloc_object_attributes(attr, &objattr, &len))
-        return STATUS_INSUFFICIENT_RESOURCES;
+    ntsync_wcstombs(name, attr->ObjectName->Buffer, sizeof(name));
 
     pthread_mutex_lock(&table_lock);
 
@@ -770,7 +780,7 @@ NTSTATUS ntsync_open_semaphore(HANDLE *handle, ACCESS_MASK access, const OBJECT_
         if (!candidate || candidate->type != NTSYNC_TYPE_SEMAPHORE || !candidate->name)
             continue;
 
-        if (objattr->name && strcmp(candidate->name, objattr->name) == 0) {
+        if (strcmp(candidate->name, name) == 0) {
             candidate->refcount++;
             *handle = index_to_handle(i);
             obj = candidate;
@@ -779,24 +789,25 @@ NTSTATUS ntsync_open_semaphore(HANDLE *handle, ACCESS_MASK access, const OBJECT_
     }
 
     pthread_mutex_unlock(&table_lock);
-    free(objattr);
 
     return obj ? STATUS_SUCCESS : STATUS_OBJECT_NAME_NOT_FOUND;
 }
 
 NTSTATUS ntsync_query_object(HANDLE handle, void *info, ULONG *ret_len, OBJECT_INFORMATION_CLASS info_class)
 {
+    struct ntsync_object *obj;
+    int index;
     TRACE("[ntsync] QueryObject\n");
 
     if (!info || !ret_len)
         return STATUS_INVALID_PARAMETER;
 
-    int index = handle_to_index(handle);
+    index = handle_to_index(handle);
     if (index < 0 || index >= MAX_NTSYNC_OBJECTS)
         return STATUS_INVALID_HANDLE;
 
     pthread_mutex_lock(&table_lock);
-    struct ntsync_object *obj = object_table[index];
+    obj = object_table[index];
     if (!obj) {
         pthread_mutex_unlock(&table_lock);
         return STATUS_INVALID_HANDLE;
@@ -805,21 +816,25 @@ NTSTATUS ntsync_query_object(HANDLE handle, void *info, ULONG *ret_len, OBJECT_I
     switch (info_class) {
         case ObjectTypeInformation: {
             const char *type_str = NULL;
+            size_t len;
+
             switch (obj->type) {
                 case NTSYNC_TYPE_EVENT:     type_str = "Event"; break;
                 case NTSYNC_TYPE_MUTEX:     type_str = "Mutant"; break;
                 case NTSYNC_TYPE_SEMAPHORE: type_str = "Semaphore"; break;
                 default: type_str = "Unknown"; break;
             }
-            size_t len = strlen(type_str);
+            len = strlen(type_str);
             memcpy(info, type_str, len);
             *ret_len = len;
             break;
         }
 
         case ObjectNameInformation: {
+            size_t len;
+
             if (obj->name) {
-                size_t len = strlen(obj->name);
+                len = strlen(obj->name);
                 memcpy(info, obj->name, len);
                 *ret_len = len;
             } else {
@@ -839,11 +854,12 @@ NTSTATUS ntsync_query_object(HANDLE handle, void *info, ULONG *ret_len, OBJECT_I
 
 NTSTATUS ntsync_pulse_event(HANDLE handle)
 {
-    int index = handle_to_index(handle);
+    int index;
     struct ntsync_object *obj;
 
     TRACE("PulseEvent on handle %p\n", handle);
 
+    index = handle_to_index(handle);
     if (index < 0 || index >= MAX_NTSYNC_OBJECTS)
         return STATUS_INVALID_HANDLE;
 
